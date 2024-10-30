@@ -1,0 +1,194 @@
+#  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+#  │ Purpose:                                                                                                         │
+#  │ - Runs checks on commits from feature branches, including:                                                       │
+#  │    - Placing a label on PR                                                                                       │
+#  │    - Running lint checks on each commit                                                                          │
+#  │    - Check for existing Release PR that are open on staging                                                      │
+#  │ - When changes are good, merge to staging queue to run testing:                                                  │
+#  │    - If testing is good -> Merge to staging branch                                                               │
+#  │    - Else               -> reject PR - user will correct errors and resubmit PR to the staging merge queue       │
+#  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+name: 0 - Run Checks & Test Changes
+
+# When to run:
+on:
+  ## Run on commits from feature branch
+  pull_request:
+    branches:
+      - staging
+      - main
+    types:
+      - opened
+      - synchronize
+      - edited
+
+  ## Run on PR Merge to staging
+  merge_group:
+    types: [checks_requested]
+
+# Jobs to Run:
+jobs:
+  ## Ran only on PR - for initial labeling
+  label-pr:
+    name: Label PR
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+
+  ## Ran on commits to feature branch & merge queue
+  lint:
+    name: Lint Code
+    environment: dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+        with:
+          lfs: true
+
+      - id: changed-files
+        uses: tj-actions/changed-files@main # @v36
+
+      - uses: pre-commit/action@release # @v3.0.1
+        with:
+          extra_args: --files ${{ steps.changed-files.outputs.all_changed_files }}
+
+      - name: Fail-catch - Pre-commit Checks
+        if: ${{ failure() && steps.precommit.conclusion == 'failure' }}
+        uses: actions/github-script@main
+        with:
+          script: |
+            core.setFailed("Run `pre-commit run -a` to fix errors locally before re-committing")
+
+  ## Run only when PR joins merge queue to staging
+  check_existing_pr:
+    name: Check for existing Release PR
+    if: github.event_name != 'pull_request' || github.event.action == 'enqueued'
+    environment: dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for Open Release PRs
+        uses: juliangruber/find-pull-request-action@v1
+        id: find-prs
+        with:
+          branch: staging
+          state: open
+
+      - name: Confirm/Deny Merge
+        run: |
+          if [ -n "${{ steps.find-prs.outputs.number }}" ]; then
+            echo "Merge is rejected - PR #${{ steps.find-prs.outputs.number }} from the staging branch exists."
+            echo "Please merge or close it before merging into this branch - to prevent piling commits to a single PR"
+            echo "Note: If you want to update existing PR - you must send the commit back to it's feature branch and undo commit on staging"
+            exit 1
+          else
+            echo "Changes are ready for merge..."
+          fi
+
+  test:
+    name: Test Changes
+    if: github.event_name != 'pull_request' || github.event.action == 'enqueued' # https://github.com/orgs/community/discussions/51120
+    environment: testing
+    needs: check_existing_pr
+    runs-on: ubuntu-latest-large # Use custom gh runner - GH hosted
+    services:
+      postgres:
+        image: corpusops/postgis:10
+        env:
+          DATABASE_URL: postgis://postgres@localhost:5432
+          POSTGRES_DB: demoapp
+          POSTGRES_PASSWORD: ""
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Fetch Doppler Secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@main
+        with:
+          doppler-token: ${{ secrets.CI_DOPPLER_TOKEN }}
+          inject-env-vars: true
+
+      - name: Checkout Code
+        uses: actions/checkout@main
+        with:
+          lfs: true
+
+      #----------------------------------------------
+      #-----------  Install Dependencies  -----------
+      #----------------------------------------------
+      - name: Setup Python
+        id: setup-python
+        uses: actions/setup-python@main
+        with:
+          python-version: 3.10.13
+
+      - name: Install Poetry
+        uses: snok/install-poetry@main
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Install gdal dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+          gdal-bin \
+          python3-gdal
+      #----------------------------------------------
+      #       load cached venv if cache exists
+      #----------------------------------------------
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@main
+        with:
+          path: .venv
+          key: venv-${{ hashFiles('poetry.lock') }}
+      #----------------------------------------------
+      # install dependencies if cache does not exist
+      #----------------------------------------------
+      - name: Setup Poetry Dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        run: |
+          poetry install --no-interaction --no-root
+
+      #----------------------------------------------
+      #----------------- Run Tests ------------------
+      #----------------------------------------------
+      - name: Run Tests - MyPy w/ ReviewDog
+        run: |
+          echo "Setup ReviewDog"
+          curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s
+
+          echo "GitHub Comment Bot reporting..."
+          make mypy_no_fail | ./bin/reviewdog -reporter=github-pr-review -efm="%f:%l:%c: %m"
+
+          echo "GitHub Checks reporting..."
+          make mypy_no_fail | ./bin/reviewdog -reporter=github-check -efm="%f:%l:%c: %m" -fail-on-error
+
+      # - name: Run Tests - PyTest Coverage
+      #   timeout-minutes: 10 # To avoid stuck test jobs - see logs for diagnosis
+      # Any issues will be reported on reporter below
+      #   run: |
+      #     make test_with_coverage || true
+
+      # - name: Publish Test Results
+      #   id: pytest
+      #   uses: dorny/test-reporter@main
+      #   if: success() || failure()  # Produce test report, pass or fail
+      #   with:
+      #     name: PyTest Code Coverage # Name of the check run which will be created
+      #     path: "./reports/pytest/test-report.xml" # Path to test results
+      #     reporter: java-junit # works w/ python too
+      #     fail-on-error: "false"

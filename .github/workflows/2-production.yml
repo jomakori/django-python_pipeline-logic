@@ -1,0 +1,143 @@
+#  ┌────────────────────────────────────────────────────────────────────────────────────┐
+#  │ Purpose:                                                                           │
+#  │ - Triggers workflow for deploying release to PROD                                  │
+#  │ - Sends a message on PR - to confirm deployment to user                            │
+#  └────────────────────────────────────────────────────────────────────────────────────┘
+name: 2 - Release to Production
+
+# Enforces main branch = prod env
+on:
+  workflow_dispatch: # manual run fallback
+  push:
+    branches:
+      - main
+
+# Permissions to write on PR
+permissions: write-all
+
+jobs:
+  build:
+    name: Build Release
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+        with:
+          lfs: true
+
+      - name: Install Doppler CLI
+        uses: dopplerhq/cli-action@master
+
+      - name: Fetch Doppler Secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@main
+        with:
+          doppler-token: ${{ secrets.PROD_DOPPLER_TOKEN }}
+          inject-env-vars: true
+
+      - name: Semantic Release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ci: true
+
+      - name: Confirm new release
+        if: steps.semantic.outputs.new_release_published == 'false'
+        uses: actions/github-script@main
+        with:
+          script: |
+            core.setFailed("Semantic version hasn't released a new version. See logs.")
+
+      - name: Save Semantic Version in Doppler
+        run: |
+          doppler secrets set SEMANTIC_VERSION="${{ steps.semantic.outputs.new_release_version }}"
+        env:
+          DOPPLER_TOKEN: ${{ secrets.PROD_DOPPLER_TOKEN }}
+
+      - uses: alexellis/arkade-get@master
+        with:
+          jq: latest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@main
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@main
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+        with:
+          driver: docker-container
+
+      - name: Build & Push to AWS ECR - w/ cache
+        uses: docker/build-push-action@master
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_PROD_REPO: ${{ env.AWS_ECR_REPO }}
+          ECR_STAGING_REPO: staging-demoapp
+          IMAGE_TAG: ${{ steps.semantic.outputs.new_release_version }}
+        with:
+          context: .
+          file: production.yml
+          push: true
+          # Tags & pushes both PROD + Staging images
+          tags:
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_PROD_REPO }}:${{ env.IMAGE_TAG }},
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_STAGING_REPO }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy Release
+    needs: build
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Doppler Secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@main
+        with:
+          doppler-token: ${{ secrets.PROD_DOPPLER_TOKEN }}
+          inject-env-vars: true
+
+      - uses: alexellis/arkade-get@master
+        with:
+          yq: latest
+
+      - name: Checkout Helm Chart
+        uses: actions/checkout@main
+        with:
+          repository: richcontext/kubernetes
+          token: ${{ steps.doppler.outputs.GITHUB_TOKEN }}
+
+      - name: Deploy Release
+        env:
+          CONTAINER_TAG: ${{ steps.doppler.outputs.SEMANTIC_VERSION }} # value refreshed in step
+        run: |
+          # Login Git
+          git config --global user.email "stable.engineering@accenture.com"
+          git config --global user.name "bot-robopony"
+
+          # Update container image tag in Kubernetes Manifest
+          cd apps/helm/demoapp
+          echo "Update Staging Image tag..."
+          yq -i e '.environments[1].image.tag = env(CONTAINER_TAG)| (... | select(tag == "!!merge")) tag = ""' values.yaml
+
+          # Check if there are any changes
+          if [[ -z $(git status -s) ]]; then
+            echo "The container tag has already been updated, exiting..."
+            exit 0
+          fi
+
+          # Push Changes - ArgoCD will auto-sync changes in cluster
+          git add .
+          git commit -m "chore(release) demoapp: Upgrade to PROD version: ${CONTAINER_TAG}"
+          git push

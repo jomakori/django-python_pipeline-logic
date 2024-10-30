@@ -1,0 +1,174 @@
+#  ┌────────────────────────────────────────────────────────────────────────────────────┐
+#  │ Purpose:                                                                           │
+#  │ - Triggers workflow for deployment to staging                                      │
+#  │ - Send a message on PR - to confirm deployment to user                             │
+#  └────────────────────────────────────────────────────────────────────────────────────┘
+name: 1 - Deploy to Staging
+
+# Enforces Staging branch = staging env
+on:
+  workflow_dispatch: # manual run fallback
+  push:
+    branches:
+      - staging
+
+# Permissions to write on PR
+permissions: write-all
+
+jobs:
+  build:
+    name: Build Staging
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+        with:
+          lfs: true
+
+      - name: Install CLI
+        uses: dopplerhq/cli-action@master
+
+      - name: Fetch Doppler Secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@main
+        with:
+          doppler-token: ${{ secrets.STG_DOPPLER_TOKEN }}
+          inject-env-vars: true
+
+      - name: Set/Save Semantic Version
+        id: version
+        env:
+          DOPPLER_TOKEN: ${{ secrets.STG_DOPPLER_TOKEN }}
+        run: |
+          # Get the PR Number
+          PR_NUM=$(gh pr view --json number -q .number)
+
+          if [ -z "$PR_NUM" ]; then
+            echo "ERROR: PR number for this commit is null. See Logs."
+            exit 1
+          fi
+
+          # Set the version
+          export semantic_version=pr-$PR_NUM
+
+          # Update version on Doppler
+          doppler secrets set SEMANTIC_VERSION=$semantic_version
+
+          # pass var to other steps
+          echo "semantic_version=pr-$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Confirm new release
+        if: steps.version.outputs.semantic_version == '' # null
+        uses: actions/github-script@main
+        with:
+          script: |
+            core.setFailed("Semantic version is null. See logs.")
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@main
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@main
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@master
+        with:
+          driver: docker-container
+
+      - name: Build & Push to AWS ECR - w/ cache
+        uses: docker/build-push-action@master
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.version.outputs.semantic_version }} # Since it was changed post-fetch
+        with:
+          context: .
+          file: production.yml
+          push: true
+          tags: "${{ env.ECR_REGISTRY }}/${{ env.AWS_ECR_REPO }}:${{ env.IMAGE_TAG }}"
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy Staging
+    needs: build
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Doppler Secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@main
+        with:
+          doppler-token: ${{ secrets.STG_DOPPLER_TOKEN }}
+          inject-env-vars: true
+
+      - uses: alexellis/arkade-get@master
+        with:
+          yq: latest
+
+      - name: Checkout Helm Chart
+        uses: actions/checkout@main
+        with:
+          repository: richcontext/kubernetes
+          token: ${{ steps.doppler.outputs.GITHUB_TOKEN }}
+
+      - name: Deploy Staging
+        env:
+          CONTAINER_TAG: ${{ steps.doppler.outputs.SEMANTIC_VERSION }} #retrieved from build step
+        run: |
+          # Login Git
+          git config --global user.email "stable.engineering@accenture.com"
+          git config --global user.name "bot-robopony"
+
+          # Update container image tag in Helm Chart
+          cd apps/helm/demoapp
+          yq --version
+          yq -i e '.environments[0].image.tag = env(CONTAINER_TAG)| (... | select(tag == "!!merge")) tag = ""' values.yaml
+
+          # Check if there are any changes
+          if [[ -z $(git status -s) ]]; then
+            echo "The container tag has already been updated, exiting..."
+            exit 0
+          fi
+
+          # Push Changes - ArgoCD will auto-sync changes in cluster
+          git add .
+          git commit -m "chore(staging) demoapp: Test changes in: ${CONTAINER_TAG}"
+          git push
+
+  comment-pr:
+    name: Comment on PR
+    environment: staging
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@main
+
+      - name: Comment on PR
+        run: |
+          PR_NUM=$(gh pr view --json number -q .number)
+          gh pr comment $PR_NUM --repo "richcontext/demoapp" --body "$msg"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          msg: |
+            ## ✅ The Staging Env has successfully spun up
+            - ### [demoapp API](https://staging-demoapp.intrc.net/)
+            - ### [demoapp Flower](https://staging-flower.intrc.net/)
+
+            ### Verify deployment by:
+            - #### Syncing the version in [ArgoCD](https://argocd.intrc.net/applications/argocd/demoapp?view=network&resource=namespace%3Ademoapp-staging)
+            - #### Confirming `rev` label in EKS pods/deployments = PR number
+
+            ## 📄 Checklist before merging to PROD
+            - [ ] Confirm Changes
+            - [ ] Merge PR - to release changes to production.
+
+            > [!IMPORTANT]
+            > If there are changes that need to be made or merge conflicts you need to resolve, make the changes in feature branch, then merge branch to staging
+              - Reason: The `staging` branch only allows changes that go thru the Merge Queue - hence need for new merge from feature branch

@@ -1,0 +1,16 @@
+#  ┌────────────────────────────────────────────────────────────────────────------──┐
+#  │ Purpose:                                                                       │
+#  │ - Used to label PR's based on base branch, file changes, etc                   │
+#  │     -> Merge to Staging  = `Pre-Release` Label                                 │
+#  │     -> Merge to main     = `Release` Label                                     │
+#  └─────────────────────────────────────────────────────────────────────------─────┘
+# Based on merge branch
+pre-release:
+- base-branch: "staging"
+release:
+- base-branch: "main"
+
+# Based on file changes
+Documentation:
+- changed-files:
+  - any-glob-to-any-file: '**/*.md'
